@@ -79,10 +79,18 @@ class ChatEnhancerPlugin(Star):
 
         return text
 
-    def _split_message(self, text: str) -> List[str]:
-        """智能分段消息"""
+    def _split_message(self, text: str, remove_md: bool = False) -> List[str]:
+        """智能分段消息
+
+        Args:
+            text: 要分段的文本
+            remove_md: 是否对每段移除 MD 格式
+        """
         if not self.config.get("enable_split", True):
-            return [text]
+            result = [text]
+            if remove_md:
+                result = [self._remove_markdown(seg) for seg in result]
+            return result
 
         max_segments = self.config.get("max_segments", 5)
         split_chars = self.config.get("split_chars", ["。", "！", "？", "?", "!", "\n"])
@@ -113,7 +121,11 @@ class ChatEnhancerPlugin(Star):
                     temp += seg
             if temp:
                 merged.append(temp)
-            return merged
+            segments = merged
+
+        # 如果需要，对每段移除 MD 格式
+        if remove_md and self.config.get("remove_markdown", True):
+            segments = [self._remove_markdown(seg) for seg in segments]
 
         return segments if segments else [text]
 
@@ -134,8 +146,8 @@ class ChatEnhancerPlugin(Star):
                 logger.info(f"检测到关键词 '{keyword}'，触发合并转发")
                 return True
 
-        # 检查分段数
-        segments = self._split_message(text)
+        # 检查分段数（先分段再判断，不去除MD）
+        segments = self._split_message(text, remove_md=False)
         max_segments = self.config.get("max_segments", 5)
         if len(segments) > max_segments:
             logger.info(f"分段数 {len(segments)} 超过阈值 {max_segments}，触发合并转发")
@@ -146,7 +158,8 @@ class ChatEnhancerPlugin(Star):
     async def _send_forward(self, event: AstrMessageEvent, text: str):
         """发送合并转发消息"""
         bot_name = self.config.get("bot_name", "AI助手")
-        segments = self._split_message(text)
+        # 先分段，再对每段去除 MD 格式
+        segments = self._split_message(text, remove_md=True)
 
         # 创建节点列表
         nodes = []
