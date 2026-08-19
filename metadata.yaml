@@ -1,0 +1,10 @@
+name: astrbot_plugin_chat_enhancer
+display_name: 聊天增强器
+desc: 集成消息分段、Markdown格式消除、智能长文本合并转发等功能，让AI回复更自然
+short_desc: 消息分段 + MD格式消除 + 智能合并转发
+version: v1.0.0
+author: yvdi-abc
+support_platforms:
+  - aiocqhttp
+  - qq_official
+astrbot_version: ">=4.16,<5"

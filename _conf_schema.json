@@ -1,0 +1,63 @@
+{
+  "enable_split": {
+    "description": "是否启用消息分段发送",
+    "type": "bool",
+    "default": true,
+    "hint": "将长消息分段发送，模拟真实聊天节奏"
+  },
+  "max_segments": {
+    "description": "最大分段数",
+    "type": "int",
+    "default": 5,
+    "hint": "超过此段数的消息将触发合并转发"
+  },
+  "split_chars": {
+    "description": "分段符号",
+    "type": "list",
+    "default": ["。", "！", "？", "?", "!", "\n"],
+    "hint": "遇到这些符号时进行分段"
+  },
+  "remove_markdown": {
+    "description": "是否移除 Markdown 格式",
+    "type": "bool",
+    "default": true,
+    "hint": "消除 **粗体**、*斜体*、`代码` 等 MD 格式，使输出更自然"
+  },
+  "keep_code_blocks": {
+    "description": "保留代码块",
+    "type": "bool",
+    "default": true,
+    "hint": "即使开启 MD 消除，也保留 ```代码块``` 的内容"
+  },
+  "enable_forward": {
+    "description": "是否启用智能合并转发",
+    "type": "bool",
+    "default": true,
+    "hint": "当检测到长文本回答时，自动使用合并转发形式发送"
+  },
+  "forward_threshold": {
+    "description": "合并转发阈值（字符数）",
+    "type": "int",
+    "default": 500,
+    "hint": "超过此字符数且分段数超过最大分段数时，使用合并转发"
+  },
+  "forward_keywords": {
+    "description": "触发合并转发的关键词",
+    "type": "list",
+    "default": ["解释", "说明", "介绍", "教程", "步骤", "原理", "详细", "如何"],
+    "hint": "用户消息包含这些词时，倾向于使用合并转发"
+  },
+  "send_speed": {
+    "description": "发送速度",
+    "type": "string",
+    "default": "自然",
+    "options": ["快速", "自然", "慢速"],
+    "hint": "控制分段消息之间的发送间隔"
+  },
+  "bot_name": {
+    "description": "合并转发中显示的Bot名称",
+    "type": "string",
+    "default": "AI助手",
+    "hint": "在合并转发消息中显示的发送者名称"
+  }
+}
