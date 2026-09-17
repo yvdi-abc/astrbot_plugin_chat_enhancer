@@ -26,6 +26,8 @@ INNER_MONOLOGUE_RE = re.compile(
     r"[（(]\s*(?:心想|内心OS|内心os|心中|心里想|暗自|内心|内心独白|OS)\s*[：:][^）)]{0,400}[）)]",
 )
 THINK_BLOCK_RE = re.compile(r"<think(?:ing)?>[\s\S]*?</think(?:ing)?>", re.IGNORECASE)
+# 表情包插件的情绪标记（正常由 meme_manager 自己剥离；它未接管时兜底，避免 &&happy&& 被当正文发出）
+EMOTION_MARKUP_RE = re.compile(r"&&[^&\n]{1,20}&&")
 
 
 # 其它内部上下文痕迹（记忆/任务/系统提示被模型复述出来时清理）
@@ -66,6 +68,7 @@ def clean_internal_markup(text: str) -> str:
     t = MEMORY_HEAD_RE.sub("", t)
     t = MSG_ID_RE.sub("", t)
     t = EMOTION_TAG_ANY_RE.sub("", t)
+    t = EMOTION_MARKUP_RE.sub("", t)
     t = INNER_MONOLOGUE_RE.sub("", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
@@ -668,6 +671,8 @@ class ChatEnhancerPlugin(Star):
             result.chain = []
             return
         if not text:
+            logger.info("[聊天增强器] 清洗后内容为空（仅剩内部标记），已取消发送")
+            result.chain = []
             return
 
         user_message = event.message_str
