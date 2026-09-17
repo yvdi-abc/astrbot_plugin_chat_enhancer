@@ -1,17 +1,101 @@
 import re
+import os
+import json
 import asyncio
+import sqlite3
 import time
 from typing import List, Tuple
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api import logger, AstrBotConfig
-from astrbot.api.star import Context, Star
+from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.message_components import Plain, BaseMessageComponent, Node, Nodes
 from astrbot.api.provider import LLMResponse
 
 # 兜底：剥离模型可能输出的 <quote .../> <mention .../> <refuse/> 等控制标签，
 # 防止被当作普通文本发送出去（配合 enhance_mode/proactive_reply 的引用标签方案）。
 CONTROL_TAG_RE = re.compile(r"</?(?:quote|mention|refuse)\b[^>]*>", re.IGNORECASE)
+# 内部标注/心理描写清理：情绪标签（mmx_speech TTS 用）与模型漏出的内心独白
+EMOTION_TAG_RE = re.compile(
+    r"^\s*[\[【(（]\s*(?:开心|高兴|快乐|悲伤|难过|伤心|委屈|愤怒|生气|恼火|害怕|恐惧|厌恶|嫌弃|惊讶|震惊|兴奋|平静|温柔|慵懒)\s*[\]】)）]\s*",
+)
+EMOTION_TAG_ANY_RE = re.compile(
+    r"[\[【]\s*(?:开心|高兴|快乐|悲伤|难过|伤心|委屈|愤怒|生气|恼火|害怕|恐惧|厌恶|嫌弃|惊讶|震惊|兴奋|平静|温柔|慵懒)\s*[\]】]\s*",
+)
+INNER_MONOLOGUE_RE = re.compile(
+    r"[（(]\s*(?:心想|内心OS|内心os|心中|心里想|暗自|内心|内心独白|OS)\s*[：:][^）)]{0,400}[）)]",
+)
+THINK_BLOCK_RE = re.compile(r"<think(?:ing)?>[\s\S]*?</think(?:ing)?>", re.IGNORECASE)
+
+
+# 其它内部上下文痕迹（记忆/任务/系统提示被模型复述出来时清理）
+SYSTEM_REMINDER_RE = re.compile(r"<system_reminder>[\s\S]*?</system_reminder>", re.IGNORECASE)
+GLOBAL_CONTEXT_RE = re.compile(r"<recent_global_context>[\s\S]*?</recent_global_context>", re.IGNORECASE)
+INTERNAL_HINT_RE = re.compile(r"\[内部指示\][^\n]*", re.IGNORECASE)
+CRON_LINE_RE = re.compile(r"^\s*\[CronJob\][^\n]*", re.MULTILINE)
+TASK_RESULT_RE = re.compile(r"^\s*Output your last task result below\.[^\n]*", re.MULTILINE | re.IGNORECASE)
+MSG_ID_RE = re.compile(r"\[MSG_ID:\d+\]")
+MEMORY_HEAD_RE = re.compile(r"^\s*【记忆参考】[^\n]*", re.MULTILINE)
+
+
+# 模型被历史里的 refuse 污染后会把 "refuse" 当正文输出（曾引发模仿循环）
+REFUSE_ONLY_RE = re.compile(
+    r"^\s*(?:refuse\s*/?>?|<refuse\s*/>|refuse)(?:\s*[,，.。!！]?\s*(?:refuse|<refuse\s*/>))*\s*$",
+    re.IGNORECASE,
+)
+
+
+def is_refuse_only(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if "<refuse" in t.lower():
+        t = re.sub(r"</?refuse\s*/?>", " refuse ", t, flags=re.IGNORECASE)
+    return bool(REFUSE_ONLY_RE.match(t))
+
+
+def clean_internal_markup(text: str) -> str:
+    """剥掉不应出现在聊天里的内部标注：情绪标签、内心独白、think 块、系统/记忆痕迹。"""
+    t = text or ""
+    t = THINK_BLOCK_RE.sub("", t)
+    t = SYSTEM_REMINDER_RE.sub("", t)
+    t = GLOBAL_CONTEXT_RE.sub("", t)
+    t = INTERNAL_HINT_RE.sub("", t)
+    t = CRON_LINE_RE.sub("", t)
+    t = TASK_RESULT_RE.sub("", t)
+    t = MEMORY_HEAD_RE.sub("", t)
+    t = MSG_ID_RE.sub("", t)
+    t = EMOTION_TAG_ANY_RE.sub("", t)
+    t = INNER_MONOLOGUE_RE.sub("", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+
+SYNTHETIC_MSG_RE = re.compile(
+    r"\[CronJob\]|\[BackgroundTask\]|Output your last task result below\.?|"
+    r"I finished (?:this job|the task), here is the result",
+    re.IGNORECASE,
+)
+INJECT_HEADER_RE = re.compile(r"【记忆参考】以下是你与该用户在其他私聊中的最近对话记录")
+
+
+def is_synthetic_message(text) -> bool:
+    """是否为后台任务(cron/background)产生的合成消息（不该出现在历史里）。"""
+    if not text:
+        return False
+    s = text if isinstance(text, str) else str(text)
+    return bool(SYNTHETIC_MSG_RE.search(s))
+
+
+def clean_synthetic_lines(text: str) -> str:
+    """逐行清洗文本中的合成任务痕迹（用于 system_prompt 等不能整条丢弃的场景）。"""
+    t = text or ""
+    t = CRON_LINE_RE.sub("", t)
+    t = TASK_RESULT_RE.sub("", t)
+    t = re.sub(r"^\s*\[BackgroundTask\][^\n]*", "", t, flags=re.MULTILINE)
+    t = re.sub(r"^\s*I finished (?:this job|the task), here is the result[^\n]*", "", t, flags=re.MULTILINE | re.IGNORECASE)
+    return re.sub(r"\n{3,}", "\n\n", t)
 
 
 class ChatEnhancerPlugin(Star):
@@ -39,6 +123,122 @@ class ChatEnhancerPlugin(Star):
         logger.info(f"消息分段: {self.config.get('enable_split', True)}")
         logger.info(f"MD格式消除: {self.config.get('remove_markdown', True)}")
         logger.info(f"智能合并转发: {self.config.get('enable_forward', True)}")
+        # 后台定时清理历史里的合成任务痕迹（cron/后台任务提示词与回显）
+        if self.config.get("auto_purge_history", True):
+            self._purge_task = asyncio.create_task(self._history_purge_loop())
+            logger.info("[聊天增强器] 历史净化任务已启动（每 30 分钟一次）")
+
+    async def _history_purge_loop(self):
+        """周期性把合成任务消息（cron 提示词/回显）从对话历史里删掉。
+
+        核心的 history_saver 曾把 "[CronJob] ... I finished this job" 写进用户
+        私聊/群聊历史，模型会照抄该格式导致"回复很奇怪"。这里做兜底清理，
+        即使 AstrBot 升级覆盖了核心补丁，历史也不会被持续污染。
+        """
+        while True:
+            try:
+                await asyncio.sleep(1800)
+                removed = await asyncio.to_thread(self._purge_synthetic_history)
+                if removed:
+                    logger.info(f"[聊天增强器] 历史净化：清除合成任务消息 {removed} 条")
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[聊天增强器] 历史净化失败（已忽略）: {exc}")
+
+    def _find_db_path(self) -> str:
+        """定位 AstrBot 的会话数据库路径。"""
+        candidates = []
+        try:
+            from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+            candidates.append(os.path.join(get_astrbot_data_path(), "data_v4.db"))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            candidates.append(
+                os.path.join(
+                    StarTools.get_data_dir().parent.parent, "data_v4.db"
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        candidates.append(
+            "/root/.local/share/uv/tools/astrbot/data/data_v4.db"
+        )
+        for p in candidates:
+            if p and os.path.exists(p):
+                return p
+        return ""
+
+    def _purge_synthetic_history(self) -> int:
+        """同步执行的历史清理，返回删除的消息条数。"""
+        db_path = self._find_db_path()
+        if not db_path:
+            return 0
+        con = sqlite3.connect(db_path, timeout=30)
+        removed = 0
+        try:
+            cur = con.cursor()
+            cur.execute("SELECT conversation_id, content FROM conversations")
+            rows = cur.fetchall()
+            for cid, content in rows:
+                try:
+                    msgs = json.loads(content)
+                except Exception:
+                    continue
+                if not isinstance(msgs, list):
+                    continue
+                new = []
+                touched = False
+                for m in msgs:
+                    if not isinstance(m, dict):
+                        new.append(m)
+                        continue
+                    c = m.get("content")
+                    if isinstance(c, str):
+                        if is_synthetic_message(c):
+                            touched = True
+                            removed += 1
+                            continue
+                        n = clean_synthetic_lines(c)
+                        if n != c:
+                            touched = True
+                            m = dict(m)
+                            m["content"] = n
+                    elif isinstance(c, list):
+                        parts = []
+                        for p in c:
+                            if isinstance(p, dict) and p.get("type") == "text":
+                                raw = str(p.get("text") or "")
+                                if is_synthetic_message(raw):
+                                    touched = True
+                                    removed += 1
+                                    continue
+                                t = clean_synthetic_lines(raw)
+                                if t != raw:
+                                    touched = True
+                                    p = dict(p)
+                                    p["text"] = t
+                            parts.append(p)
+                        if parts != c:
+                            m = dict(m)
+                            m["content"] = parts
+                    new.append(m)
+                if touched:
+                    cur.execute(
+                        "UPDATE conversations SET content=? WHERE conversation_id=?",
+                        (json.dumps(new, ensure_ascii=False), cid),
+                    )
+            con.commit()
+        finally:
+            con.close()
+        return removed
+
+    async def terminate(self):
+        task = getattr(self, "_purge_task", None)
+        if task:
+            task.cancel()
 
     # ------------------------------------------------------------------ #
     # Markdown 处理                                                       #
@@ -310,6 +510,11 @@ class ChatEnhancerPlugin(Star):
         """统一的发送处理逻辑：合并转发 / 分段发送 / 直接发送。"""
         # 兜底剥离控制标签，避免 <quote/> 等被当正文发出
         text = CONTROL_TAG_RE.sub("", text or "").strip()
+        text = clean_internal_markup(text)
+        text = EMOTION_TAG_RE.sub("", text).strip()
+        if is_refuse_only(text):
+            logger.info("[聊天增强器] 直发出口拦截纯 refuse 文本，已取消发送")
+            return
         if not text:
             return
         if should_forward and self._is_forward_platform(event):
@@ -331,6 +536,66 @@ class ChatEnhancerPlugin(Star):
     # LLM 事件钩子                                                       #
     # ------------------------------------------------------------------ #
 
+    @filter.on_llm_request(priority=-99999)
+    async def on_llm_request(self, event: AstrMessageEvent, req):
+        """请求前清洗注入内容与历史，防止模型被后台任务/跨群注入文本带偏。
+
+        历史里一旦残留 "[CronJob] ... I finished this job" / "Output your last task
+        result below." / "【记忆参考】..." 这类合成文本，模型就会照抄这种格式，
+        表现为"回复很奇怪"，并且会被跨群插件二次传染到别的会话。
+        """
+        try:
+            ctxs = getattr(req, "contexts", None)
+            if ctxs:
+                cleaned = []
+                for m in ctxs:
+                    if not isinstance(m, dict):
+                        cleaned.append(m)
+                        continue
+                    content = m.get("content")
+                    if isinstance(content, str):
+                        if is_synthetic_message(content):
+                            continue  # 整条合成消息丢弃
+                        new = clean_synthetic_lines(content)
+                        if not new:
+                            continue
+                        if new != content:
+                            m = dict(m)
+                            m["content"] = new
+                    elif isinstance(content, list):
+                        parts = []
+                        for p in content:
+                            if isinstance(p, dict) and p.get("type") == "text":
+                                raw = str(p.get("text") or "")
+                                if is_synthetic_message(raw):
+                                    continue
+                                t = clean_synthetic_lines(raw)
+                                if not t:
+                                    continue
+                                if t != raw:
+                                    p = dict(p)
+                                    p["text"] = t
+                            parts.append(p)
+                        if not parts:
+                            continue
+                        m = dict(m)
+                        m["content"] = parts
+                    cleaned.append(m)
+                if len(cleaned) != len(ctxs):
+                    logger.info(
+                        f"[聊天增强器] 请求前丢弃合成任务消息 {len(ctxs) - len(cleaned)} 条"
+                    )
+                req.contexts = cleaned
+            # system_prompt 里的合成回显逐行清掉（不整条丢弃，避免破坏人设提示词）
+            sp = getattr(req, "system_prompt", None)
+            if isinstance(sp, str) and sp:
+                # 只清合成任务回显；<recent_global_context> 是 LivelyState 的状态注入，保留
+                new_sp = clean_synthetic_lines(sp)
+                if new_sp.strip() and new_sp != sp:
+                    req.system_prompt = new_sp
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[聊天增强器] 请求前清洗失败（已忽略）: {exc}")
+
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
         """在 LLM 响应后处理消息（仅主对话链路触发）"""
@@ -338,6 +603,13 @@ class ChatEnhancerPlugin(Star):
         original_text = resp.completion_text
 
         if not original_text or not original_text.strip():
+            return
+
+        # 纯 refuse 回复：清空响应 → 不发送、也不会写入对话历史（避免模仿循环）
+        if is_refuse_only(original_text):
+            logger.info("[聊天增强器] 检测到纯 refuse 回复，已丢弃且不写入历史")
+            resp.completion_text = ""
+            event._chat_enhancer_text = ""
             return
 
         # 1. 移除 Markdown 格式
@@ -387,6 +659,14 @@ class ChatEnhancerPlugin(Star):
 
         # 兜底剥离 <quote/> <mention/> <refuse/> 等控制标签（enhance/proactive 引用方案残留）
         text = CONTROL_TAG_RE.sub("", text).strip()
+        # 兜底剥离情绪标签与内心独白（mmx_speech / 角色扮演提示词可能让模型漏出）
+        text = clean_internal_markup(text)
+        text = EMOTION_TAG_RE.sub("", text).strip()
+        # 纯 refuse 一律不发送（历史上曾经把 refuse 当正文发出去）
+        if is_refuse_only(text):
+            logger.info("[聊天增强器] 装饰阶段拦截纯 refuse 文本，已取消发送")
+            result.chain = []
+            return
         if not text:
             return
 

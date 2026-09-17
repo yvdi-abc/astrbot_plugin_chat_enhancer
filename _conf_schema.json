@@ -26,7 +26,14 @@
   "split_chars": {
     "description": "分段符号",
     "type": "list",
-    "default": ["。", "！", "？", "?", "!", "\n"],
+    "default": [
+      "。",
+      "！",
+      "？",
+      "?",
+      "!",
+      "\n"
+    ],
     "hint": "遇到这些符号时进行分段"
   },
   "remove_markdown": {
@@ -56,14 +63,27 @@
   "forward_keywords": {
     "description": "触发合并转发的关键词",
     "type": "list",
-    "default": ["解释", "说明", "介绍", "教程", "步骤", "原理", "详细", "如何"],
+    "default": [
+      "解释",
+      "说明",
+      "介绍",
+      "教程",
+      "步骤",
+      "原理",
+      "详细",
+      "如何"
+    ],
     "hint": "用户消息包含这些词时，倾向于使用合并转发"
   },
   "send_speed": {
     "description": "发送速度",
     "type": "string",
     "default": "自然",
-    "options": ["快速", "自然", "慢速"],
+    "options": [
+      "快速",
+      "自然",
+      "慢速"
+    ],
     "hint": "控制分段消息之间的发送间隔"
   },
   "bot_name": {
@@ -71,5 +91,10 @@
     "type": "string",
     "default": "AI助手",
     "hint": "在合并转发消息中显示的发送者名称"
+  },
+  "auto_purge_history": {
+    "description": "自动净化历史（清理 cron/后台任务合成消息，防模型模仿奇怪格式）",
+    "type": "bool",
+    "default": true
   }
 }
