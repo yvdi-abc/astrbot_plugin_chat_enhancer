@@ -96,5 +96,15 @@
     "description": "自动净化历史（清理 cron/后台任务合成消息，防模型模仿奇怪格式）",
     "type": "bool",
     "default": true
+  },
+  "debug_dump_request": {
+    "description": "调试：把发给模型的完整请求写入 plugin_data/chat_enhancer_last_request.json（排查认错人/串台用）",
+    "type": "bool",
+    "default": false
+  },
+  "owner_id": {
+    "description": "主人的QQ号（唯一被认定为恋人/男朋友的ID，认人只看这个数字ID）",
+    "type": "string",
+    "default": "3625607718"
   }
 }

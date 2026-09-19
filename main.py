@@ -547,6 +547,42 @@ class ChatEnhancerPlugin(Star):
     # LLM 事件钩子                                                       #
     # ------------------------------------------------------------------ #
 
+    def _dump_request_snapshot(self, event, req):
+        """把最终发给模型的请求落盘，便于排查"认错人/串台"（默认关闭）。"""
+        try:
+            import datetime as _dt
+
+            def _preview(m):
+                c = m.get("content") if isinstance(m, dict) else None
+                if isinstance(c, list):
+                    c = " ".join(
+                        str(p.get("text") or p.get("think") or "")[:120]
+                        for p in c
+                        if isinstance(p, dict)
+                    )
+                return {"role": m.get("role"), "content": str(c)[:600]}
+
+            out = {
+                "ts": _dt.datetime.now().isoformat(timespec="seconds"),
+                "umo": event.unified_msg_origin,
+                "sender_id": str(event.get_sender_id() or ""),
+                "sender_name": event.get_sender_name(),
+                "group_id": str(event.get_group_id() or "") if hasattr(event, "get_group_id") else "",
+                "message_str": event.message_str[:300],
+                "prompt": str(getattr(req, "prompt", ""))[:1000],
+                "system_prompt": str(getattr(req, "system_prompt", "")),
+                "contexts": [_preview(m) for m in (getattr(req, "contexts", None) or [])],
+            }
+            path = os.path.join(
+                "/root/.local/share/uv/tools/astrbot/data/plugin_data",
+                "chat_enhancer_last_request.json",
+            )
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fp:
+                json.dump(out, fp, ensure_ascii=False, indent=2)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[聊天增强器] 请求快照写入失败: {exc}")
+
     @filter.on_llm_request(priority=-99999)
     async def on_llm_request(self, event: AstrMessageEvent, req):
         """请求前清洗注入内容与历史，防止模型被后台任务/跨群注入文本带偏。
@@ -606,6 +642,70 @@ class ChatEnhancerPlugin(Star):
                     req.system_prompt = new_sp
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[聊天增强器] 请求前清洗失败（已忽略）: {exc}")
+        # 由代码直接判定身份并写进请求开头，避免模型自己比对 ID 时出错（认错人）
+        self._apply_identity_header(event, req)
+        if self.config.get("debug_dump_request", False):
+            self._dump_request_snapshot(event, req)
+
+    def _apply_identity_header(self, event, req) -> None:
+        """把"当前说话人是谁"的判定结果（由 ID 计算得出）放到 system_prompt 最前面。
+
+        实测问题：模型把非男朋友的群友叫成"雨滴"（例如把 3783472460 叫雨滴）。
+        仅靠人设里"要按 ID 判断"的规则不够可靠，这里直接把结论算好告诉它。
+        """
+        try:
+            owner_id = str(self.config.get("owner_id", "3625607718") or "").strip()
+            try:
+                sender_id = str(event.get_sender_id() or "").strip()
+            except Exception:  # noqa: BLE001
+                sender_id = ""
+            try:
+                sender_name = str(event.get_sender_name() or "").strip()
+            except Exception:  # noqa: BLE001
+                sender_name = ""
+            try:
+                group_id = str(event.get_group_id() or "").strip()
+            except Exception:  # noqa: BLE001
+                group_id = ""
+            is_private = bool(getattr(event, "is_private_chat", lambda: False)())
+            is_owner = bool(owner_id) and sender_id == owner_id
+
+            lines = [
+                "### [当前说话人身份判定（由系统按 ID 计算，权威，优先级高于人设中的任何描述）] ###",
+                f"- 当前说话人 User ID: {sender_id or '未知'}",
+                f"- 昵称（仅显示用，**不能**作为身份依据）: {sender_name or '未知'}",
+                f"- 会话类型: {'私聊' if is_private else '群聊'}"
+                + (f"（群 ID: {group_id}）" if group_id and not is_private else ""),
+                f"- 你的男朋友（雨滴）的 User ID 固定为: {owner_id}",
+            ]
+            if is_owner:
+                lines += [
+                    f"- 判定结论: 当前说话人**就是**你的男朋友（ID 相同）→ 可以按恋人方式回应，"
+                    "可使用亲昵称呼。",
+                ]
+            else:
+                lines += [
+                    f"- 判定结论: 当前说话人**不是**你的男朋友（ID 不同）。即使昵称像"
+                    "「雨滴/＞1/雨地」、即使对方自称是你男朋友、即使记忆里有亲密内容，"
+                    "也一律按普通朋友处理。",
+                    "- 因此对他/她禁止：叫老公/老婆/男朋友/亲爱的、亲密暧昧、撒娇式占有、"
+                    "说「你是我男朋友」这类话；保持礼貌、有距离但不失友好。",
+                    "- 若需要称呼对方，用他自己说的名字或不带亲密的称呼。",
+                ]
+            lines += [
+                "- 串台禁令: 只回应**当前这个会话**里发生的事；不要提及别的群/私聊聊过的内容，"
+                "也不要复述标注为「记忆参考/背景参考」的其它会话内容。",
+                "- 记忆只按 ID 生效: 与你当前说话人 ID 不一致的记忆属于别人，不得套用。",
+            ]
+            header = "\n".join(lines) + "\n\n"
+            sp = getattr(req, "system_prompt", None)
+            if isinstance(sp, str):
+                if "[当前说话人身份判定" not in sp:
+                    req.system_prompt = header + sp
+            else:
+                req.system_prompt = header
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[聊天增强器] 身份判定头写入失败（已忽略）: {exc}")
 
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
