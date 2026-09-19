@@ -106,5 +106,10 @@
     "description": "主人的QQ号（唯一被认定为恋人/男朋友的ID，认人只看这个数字ID）",
     "type": "string",
     "default": "3625607718"
+  },
+  "max_exclamation_per_message": {
+    "description": "每条消息最多保留几个感叹号（多余的改成句号）：0=完全不使用感叹号，-1=不限制",
+    "type": "int",
+    "default": 1
   }
 }

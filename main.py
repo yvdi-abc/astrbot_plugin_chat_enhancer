@@ -109,6 +109,47 @@ def clean_synthetic_lines(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", t)
 
 
+EXCLAM_RE = re.compile(r"[！!]")
+
+
+def limit_exclamations(text: str, limit: int = 1) -> str:
+    """收敛感叹号：最多保留 limit 个，多余的句末感叹号改为句号。
+
+    用户反馈"说话不要一直用感叹号"。仅靠人设规则模型会反复犯，这里做确定性兜底：
+    - 连用感叹号（！！/！！！）合并为一个
+    - 「！？」「？！］统一为「？」
+    - 超过 limit 的「！」改成「。」
+    limit < 0 表示不限制；limit = 0 表示完全不用感叹号（全部改句号）。
+    """
+    if not text:
+        return text
+    t = str(text)
+    t = re.sub(r"[！!]{2,}", "！", t)
+    t = re.sub(r"[！!][？?]", "？", t)
+    t = re.sub(r"[？?][！!]", "？", t)
+    # 爆发式连标点（"你！到！底！"）→ 整段删掉中间感叹号，保留最后一个
+    prev = None
+    while prev != t:
+        prev = t
+        t = re.sub(r"！(?=[\u4e00-\u9fff]！)", "", t)
+    if limit < 0:
+        return t
+    out = []
+    seen = 0
+    n = len(t)
+    for i, ch in enumerate(t):
+        if ch in "！!":
+            seen += 1
+            if seen <= limit:
+                out.append("！")
+                continue
+            # 超出限制的感叹号统一改句号（爆发式连标点已在上一步处理）
+            out.append("。")
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
 class ChatEnhancerPlugin(Star):
     """聊天增强器插件。
 
@@ -523,6 +564,10 @@ class ChatEnhancerPlugin(Star):
         text = CONTROL_TAG_RE.sub("", text or "").strip()
         text = clean_internal_markup(text)
         text = EMOTION_TAG_RE.sub("", text).strip()
+        # 收敛感叹号（避免"每句都用！"）
+        text = limit_exclamations(
+            text, int(self.config.get("max_exclamation_per_message", 1) or 0)
+        ).strip()
         if is_refuse_only(text):
             logger.info("[聊天增强器] 直发出口拦截纯 refuse 文本，已取消发送")
             return
@@ -773,6 +818,10 @@ class ChatEnhancerPlugin(Star):
         # 兜底剥离情绪标签与内心独白（mmx_speech / 角色扮演提示词可能让模型漏出）
         text = clean_internal_markup(text)
         text = EMOTION_TAG_RE.sub("", text).strip()
+        # 收敛感叹号（避免"每句都用！"）
+        text = limit_exclamations(
+            text, int(self.config.get("max_exclamation_per_message", 1) or 0)
+        ).strip()
         # 纯 refuse 一律不发送（历史上曾经把 refuse 当正文发出去）
         if is_refuse_only(text):
             logger.info("[聊天增强器] 装饰阶段拦截纯 refuse 文本，已取消发送")
