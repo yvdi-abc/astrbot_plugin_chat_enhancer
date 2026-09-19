@@ -80,15 +80,23 @@ SYNTHETIC_MSG_RE = re.compile(
     r"I finished (?:this job|the task), here is the result",
     re.IGNORECASE,
 )
+# 插件注入的"指令块"被当成 user 消息存进历史后，模型会误以为用户说过这些话
+# （曾导致内部指令泄漏/奇怪回复）。rp4DeepSeek 的【思维模式要求】属于此类。
+INSTRUCTION_BLOCK_RE = re.compile(
+    r"^\s*【(?:思维模式要求|角色沉浸要求|系统提示|内部指示|记忆参考|系统指令)】"
+)
 INJECT_HEADER_RE = re.compile(r"【记忆参考】以下是你与该用户在其他私聊中的最近对话记录")
 
 
 def is_synthetic_message(text) -> bool:
-    """是否为后台任务(cron/background)产生的合成消息（不该出现在历史里）。"""
+    """是否为不该出现在历史里的合成消息（后台任务回显 / 插件指令块）。"""
     if not text:
         return False
     s = text if isinstance(text, str) else str(text)
-    return bool(SYNTHETIC_MSG_RE.search(s))
+    if SYNTHETIC_MSG_RE.search(s):
+        return True
+    # 通篇都是插件注入的指令块（历史污染），整条丢弃
+    return bool(INSTRUCTION_BLOCK_RE.match(s.strip()))
 
 
 def clean_synthetic_lines(text: str) -> str:
@@ -129,7 +137,7 @@ class ChatEnhancerPlugin(Star):
         # 后台定时清理历史里的合成任务痕迹（cron/后台任务提示词与回显）
         if self.config.get("auto_purge_history", True):
             self._purge_task = asyncio.create_task(self._history_purge_loop())
-            logger.info("[聊天增强器] 历史净化任务已启动（每 30 分钟一次）")
+            logger.info("[聊天增强器] 历史净化任务已启动（每 15 分钟一次）")
 
     async def _history_purge_loop(self):
         """周期性把合成任务消息（cron 提示词/回显）从对话历史里删掉。
@@ -140,7 +148,7 @@ class ChatEnhancerPlugin(Star):
         """
         while True:
             try:
-                await asyncio.sleep(1800)
+                await asyncio.sleep(900)
                 removed = await asyncio.to_thread(self._purge_synthetic_history)
                 if removed:
                     logger.info(f"[聊天增强器] 历史净化：清除合成任务消息 {removed} 条")
