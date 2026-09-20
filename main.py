@@ -7,9 +7,20 @@ import time
 from typing import List, Tuple
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
+from astrbot.api.event.filter import EventMessageType
+from astrbot.core.star.filter.command import CommandFilter
+from astrbot.core.star.filter.command_group import CommandGroupFilter
+from astrbot.core.star.filter.regex import RegexFilter
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.star import Context, Star, StarTools
-from astrbot.api.message_components import Plain, BaseMessageComponent, Node, Nodes
+from astrbot.api.message_components import (
+    Plain,
+    BaseMessageComponent,
+    Node,
+    Nodes,
+    At,
+    Reply,
+)
 from astrbot.api.provider import LLMResponse
 
 # 兜底：剥离模型可能输出的 <quote .../> <mention .../> <refuse/> 等控制标签，
@@ -831,6 +842,51 @@ class ChatEnhancerPlugin(Star):
 
     # priority 设高：确保在 mmx_speech / 其它插件读取响应之前就把文本规范化，
     # 否则语音插件(voice_only 模式)会抢先用原文接管发送，导致标点收敛失效。
+    @filter.event_message_type(EventMessageType.ALL)
+    async def gate_group_llm_reply(self, event: AstrMessageEvent):
+        """群聊里没叫到 bot、也不是指令的消息，不进入 LLM 回复。
+
+        背景（AstrBot 机制）：唤醒前缀 '/' 会让**任何**以 / 开头的群消息被判定为
+        "唤醒"，随后走 LLM 回复——包括别的机器人的指令（/绘图、/今日猪王 等）和
+        别人的闲聊。这就是"别人聊不相干的东西 bot 也回、还以为是说自己"的来源。
+        这里做最后一道闸门：只有 ①命中指令 handler ②@了 bot ③引用了 bot 的消息
+        才放行，其余把 is_at_or_wake_command 置回 False（不 stop 事件，
+        以免影响其它插件的上下文记录）。
+        """
+        if not self.config.get("gate_group_llm_reply", True):
+            return
+        try:
+            if event.is_private_chat():
+                return
+            if not event.is_at_or_wake_command:
+                return  # 本来就不会回复（未被唤醒）
+            # ① 真的命中指令（含正则指令）→ 放行
+            handlers = event.get_extra("activated_handlers") or []
+            for h in handlers:
+                for f in getattr(h, "event_filters", []) or []:
+                    if isinstance(f, (CommandFilter, CommandGroupFilter, RegexFilter)):
+                        return
+            # ② @bot / 引用 bot 的消息 → 放行
+            self_id = str(event.get_self_id() or "")
+            try:
+                for comp in event.get_messages():
+                    if isinstance(comp, At) and str(getattr(comp, "qq", "")) == self_id:
+                        return
+                    if (
+                        isinstance(comp, Reply)
+                        and str(getattr(comp, "sender_id", "")) == self_id
+                    ):
+                        return
+            except Exception:  # noqa: BLE001
+                pass
+            event.is_at_or_wake_command = False
+            logger.info(
+                "[聊天增强器] 群聊消息既非指令也未叫到 bot，已跳过 LLM 回复 | %s",
+                (event.message_str or "")[:40],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[聊天增强器] 群聊回复闸门异常（已忽略）: {exc}")
+
     def _normalize_chain_punctuation(self, result) -> None:
         """对非 LLM 结果的纯文本组件做标点收敛（就地修改）。"""
         limit = int(self.config.get("max_exclamation_per_message", 0) or 0)
