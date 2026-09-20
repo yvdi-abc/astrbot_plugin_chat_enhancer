@@ -108,8 +108,8 @@
     "default": "3625607718"
   },
   "max_exclamation_per_message": {
-    "description": "每条消息最多保留几个感叹号（多余的改成句号）：0=完全不使用感叹号，-1=不限制",
+    "description": "每条消息最多保留几个感叹号（多余的改成句号）：0=完全不使用感叹号（默认），-1=不限制",
     "type": "int",
-    "default": 1
+    "default": 0
   }
 }

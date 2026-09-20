@@ -566,7 +566,7 @@ class ChatEnhancerPlugin(Star):
         text = EMOTION_TAG_RE.sub("", text).strip()
         # 收敛感叹号（避免"每句都用！"）
         text = limit_exclamations(
-            text, int(self.config.get("max_exclamation_per_message", 1) or 0)
+            text, int(self.config.get("max_exclamation_per_message", 0) or 0)
         ).strip()
         if is_refuse_only(text):
             logger.info("[聊天增强器] 直发出口拦截纯 refuse 文本，已取消发送")
@@ -743,16 +743,63 @@ class ChatEnhancerPlugin(Star):
                 "- 记忆只按 ID 生效: 与你当前说话人 ID 不一致的记忆属于别人，不得套用。",
             ]
             header = "\n".join(lines) + "\n\n"
+            # 结尾再放一条极短的复核提醒（模型对结尾内容更敏感，减少认错人）
+            if is_owner:
+                footer = (
+                    "\n\n### [发言前复核] ### 当前说话人 User ID = "
+                    f"{sender_id}，与男朋友 ID 一致 → 是本人。\n"
+                )
+            else:
+                footer = (
+                    "\n\n### [发言前复核] ### 当前说话人 User ID = "
+                    f"{sender_id} ≠ 男朋友 ID（{owner_id}）→ 不是本人，"
+                    "不要叫亲密称呼、不要把别人的事安到他/她身上；"
+                    "群聊里只有最后一条消息是你要回应的。\n"
+                )
             sp = getattr(req, "system_prompt", None)
             if isinstance(sp, str):
                 if "[当前说话人身份判定" not in sp:
-                    req.system_prompt = header + sp
+                    req.system_prompt = header + sp + footer
             else:
-                req.system_prompt = header
+                req.system_prompt = header + footer
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[聊天增强器] 身份判定头写入失败（已忽略）: {exc}")
 
-    @filter.on_llm_response()
+    # priority 设高：确保在 mmx_speech / 其它插件读取响应之前就把文本规范化，
+    # 否则语音插件(voice_only 模式)会抢先用原文接管发送，导致标点收敛失效。
+    @filter.on_using_llm_tool()
+    async def sanitize_outgoing_tool_text(self, event, tool, tool_args):
+        """工具直接发消息时也要收敛文本。
+
+        定时任务/主动消息让模型调用 `send_message_to_user`，那段文本是模型直接写的参数，
+        **不经过 on_llm_response**，若不管就会出现"每句都是感叹号"的主动消息。
+        这里在执行前就地清洗参数里的文本内容。
+        """
+        try:
+            if not isinstance(tool_args, dict):
+                return
+            name = str(getattr(tool, "name", "") or "")
+            if "send" not in name and "message" not in name:
+                return
+            limit = int(self.config.get("max_exclamation_per_message", 0) or 0)
+
+            def _fix(t):
+                if not isinstance(t, str) or not t.strip():
+                    return t
+                return limit_exclamations(clean_internal_markup(t), limit).strip() or t
+
+            msgs = tool_args.get("messages")
+            if isinstance(msgs, list):
+                for item in msgs:
+                    if isinstance(item, dict) and isinstance(item.get("text"), str):
+                        item["text"] = _fix(item["text"])
+            for key in ("message", "content", "text", "msg"):
+                if isinstance(tool_args.get(key), str):
+                    tool_args[key] = _fix(tool_args[key])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[聊天增强器] 工具文本清洗失败（已忽略）: {exc}")
+
+    @filter.on_llm_response(priority=99998)
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
         """在 LLM 响应后处理消息（仅主对话链路触发）"""
         # 获取原始响应文本
@@ -771,7 +818,16 @@ class ChatEnhancerPlugin(Star):
         # 1. 移除 Markdown 格式
         processed_text = self._remove_markdown(original_text)
 
-        # 2. 标记已处理内容，供装饰阶段使用
+        # 2. 收敛感叹号：直接写回 resp.completion_text，保证所有后续插件
+        #    （mmx_speech voice_only 自行发文本、分段/合并转发等）拿到的都是收敛后的文本
+        limited = limit_exclamations(
+            processed_text, int(self.config.get("max_exclamation_per_message", 0) or 0)
+        ).strip()
+        if limited and limited != original_text:
+            resp.completion_text = limited
+            processed_text = limited
+
+        # 3. 标记已处理内容，供装饰阶段使用
         event._chat_enhancer_text = processed_text
 
     @filter.on_decorating_result()
@@ -820,7 +876,7 @@ class ChatEnhancerPlugin(Star):
         text = EMOTION_TAG_RE.sub("", text).strip()
         # 收敛感叹号（避免"每句都用！"）
         text = limit_exclamations(
-            text, int(self.config.get("max_exclamation_per_message", 1) or 0)
+            text, int(self.config.get("max_exclamation_per_message", 0) or 0)
         ).strip()
         # 纯 refuse 一律不发送（历史上曾经把 refuse 当正文发出去）
         if is_refuse_only(text):
