@@ -111,5 +111,10 @@
     "description": "每条消息最多保留几个感叹号（多余的改成句号）：0=完全不使用感叹号（默认），-1=不限制",
     "type": "int",
     "default": 0
+  },
+  "normalize_all_outgoing": {
+    "description": "对其它插件产出的文本（如 /ask 的回复）也统一收敛标点",
+    "type": "bool",
+    "default": true
   }
 }

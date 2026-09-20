@@ -111,6 +111,17 @@ def clean_synthetic_lines(text: str) -> str:
 
 EXCLAM_RE = re.compile(r"[！!]")
 
+# 人设只允许"我/芙宁娜/本小姐"，但历史里积了大量"本大人"，模型照抄成复读句式
+SELF_REF_RE = re.compile(r"本大人")
+
+
+def normalize_self_reference(text: str) -> str:
+    """把历史/入库文本里越界的自称"本大人"归一为"我"。"""
+    if not text:
+        return text
+    t = SELF_REF_RE.sub("我", str(text))
+    return re.sub(r"我{2,}", "我", t)
+
 
 def limit_exclamations(text: str, limit: int = 1) -> str:
     """收敛感叹号：最多保留 limit 个，多余的句末感叹号改为句号。
@@ -254,7 +265,15 @@ class ChatEnhancerPlugin(Star):
                             removed += 1
                             continue
                         n = clean_synthetic_lines(c)
-                        if n != c:
+                        if m.get("role") == "assistant":
+                            n = normalize_self_reference(n)
+                            n2 = limit_exclamations(n, int(self.config.get("max_exclamation_per_message", 0) or 0))
+                            if n2 != n:
+                                touched = True
+                                m = dict(m)
+                                m["content"] = n2
+                                n = n2
+                        if n != c and m.get("content") == c:
                             touched = True
                             m = dict(m)
                             m["content"] = n
@@ -268,7 +287,15 @@ class ChatEnhancerPlugin(Star):
                                     removed += 1
                                     continue
                                 t = clean_synthetic_lines(raw)
-                                if t != raw:
+                                if m.get("role") == "assistant":
+                                    t = normalize_self_reference(t)
+                                    t2 = limit_exclamations(t, int(self.config.get("max_exclamation_per_message", 0) or 0))
+                                    if t2 != t:
+                                        touched = True
+                                        p = dict(p)
+                                        p["text"] = t2
+                                        t = t2
+                                if t != raw and p.get("text") == raw:
                                     touched = True
                                     p = dict(p)
                                     p["text"] = t
@@ -752,9 +779,11 @@ class ChatEnhancerPlugin(Star):
             else:
                 footer = (
                     "\n\n### [发言前复核] ### 当前说话人 User ID = "
-                    f"{sender_id} ≠ 男朋友 ID（{owner_id}）→ 不是本人，"
-                    "不要叫亲密称呼、不要把别人的事安到他/她身上；"
-                    "群聊里只有最后一条消息是你要回应的。\n"
+                    f"{sender_id} ≠ 男朋友 ID（{owner_id}）→ **不是本人**。\n"
+                    f"- 绝对不要用「雨滴」「＞1」「雨地」等男朋友专属昵称称呼他/她"
+                    "（用在别人身上就是认错人）；要称呼就用他/她自己的昵称或「你」。\n"
+                    "- 不要叫老公/老婆/亲爱的，不要有亲密暧昧；不要把别人的事安到他/她身上。\n"
+                    "- 群聊里只有最后一条消息是你要回应的。\n"
                 )
             sp = getattr(req, "system_prompt", None)
             if isinstance(sp, str):
@@ -767,6 +796,62 @@ class ChatEnhancerPlugin(Star):
 
     # priority 设高：确保在 mmx_speech / 其它插件读取响应之前就把文本规范化，
     # 否则语音插件(voice_only 模式)会抢先用原文接管发送，导致标点收敛失效。
+    def _normalize_chain_punctuation(self, result) -> None:
+        """对非 LLM 结果的纯文本组件做标点收敛（就地修改）。"""
+        limit = int(self.config.get("max_exclamation_per_message", 0) or 0)
+        try:
+            for comp in result.chain:
+                if isinstance(comp, Plain) and isinstance(comp.text, str):
+                    comp.text = limit_exclamations(comp.text, limit)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[聊天增强器] 通用标点收敛失败（已忽略）: {exc}")
+
+    @filter.after_message_sent()
+    async def normalize_saved_reply(self, event: AstrMessageEvent):
+        """回复发送后立刻把入库文本的感叹号归一。
+
+        入库的是模型原文（发送时已被收敛），若不处理，模型下一轮会照着历史里的
+        "！"继续学；这里在发送后马上改掉，避免 15 分钟净化窗口内被模仿。
+        """
+        if not self.config.get("normalize_all_outgoing", True):
+            return
+        try:
+            limit = int(self.config.get("max_exclamation_per_message", 0) or 0)
+            conv_mgr = self.context.conversation_manager
+            umo = event.unified_msg_origin
+            cid = await conv_mgr.get_curr_conversation_id(umo)
+            if not cid:
+                return
+            conv = await conv_mgr.get_conversation(umo, cid)
+            if not conv or not conv.history:
+                return
+            history = json.loads(conv.history)
+            changed = False
+            for m in history[-3:]:
+                if not isinstance(m, dict) or m.get("role") != "assistant":
+                    continue
+                cc = m.get("content")
+                if isinstance(cc, str):
+                    n = limit_exclamations(normalize_self_reference(cc), limit)
+                    if n != cc:
+                        m["content"] = n
+                        changed = True
+                elif isinstance(cc, list):
+                    for p in cc:
+                        if (
+                            isinstance(p, dict)
+                            and p.get("type") == "text"
+                            and isinstance(p.get("text"), str)
+                        ):
+                            n = limit_exclamations(normalize_self_reference(p["text"]), limit)
+                            if n != p["text"]:
+                                p["text"] = n
+                                changed = True
+            if changed:
+                await conv_mgr.update_conversation(umo, cid, history=history)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[聊天增强器] 发送后标点归一失败（已忽略）: {exc}")
+
     @filter.on_using_llm_tool()
     async def sanitize_outgoing_tool_text(self, event, tool, tool_args):
         """工具直接发消息时也要收敛文本。
@@ -821,7 +906,8 @@ class ChatEnhancerPlugin(Star):
         # 2. 收敛感叹号：直接写回 resp.completion_text，保证所有后续插件
         #    （mmx_speech voice_only 自行发文本、分段/合并转发等）拿到的都是收敛后的文本
         limited = limit_exclamations(
-            processed_text, int(self.config.get("max_exclamation_per_message", 0) or 0)
+            normalize_self_reference(processed_text),
+            int(self.config.get("max_exclamation_per_message", 0) or 0),
         ).strip()
         if limited and limited != original_text:
             resp.completion_text = limited
@@ -849,6 +935,10 @@ class ChatEnhancerPlugin(Star):
         except Exception:
             is_llm = False
         if not is_llm and not hasattr(event, "_chat_enhancer_text"):
+            # 非 LLM 结果（其它插件自己产出并发送的文本，如 /ask 自行调用 API 的回复）：
+            # 不做内部标记清洗，只统一收敛标点，避免"每一句都是感叹号"
+            if self.config.get("normalize_all_outgoing", True):
+                self._normalize_chain_punctuation(result)
             return
 
         # 如果消息链中已有 Nodes/Node（其他插件已做合并转发），跳过
