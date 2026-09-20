@@ -115,6 +115,33 @@ EXCLAM_RE = re.compile(r"[！!]")
 SELF_REF_RE = re.compile(r"本大人")
 
 
+# 复读式自报身份：模型把"我是水神芙宁娜/我是枫丹廷的审判官兼大明星"当口头禅，
+# 在群里几乎每条都念一遍（人设已禁止）。这里统一改写成自然的自称。
+IDENTITY_BOAST_SUBS = [
+    (re.compile(r"我(?:可)?是枫丹廷的审判官兼大明星"), "我是芙宁娜"),
+    (re.compile(r"我(?:可)?是水神芙宁娜"), "我是芙宁娜"),
+    (re.compile(r"我是水神。水神。"), "我是芙宁娜。"),
+    (re.compile(r"我(?:可)?是水神(?!芙宁娜)"), "我是芙宁娜"),
+    (re.compile(r"我(?:可)?是枫丹廷的?审判官"), "我是芙宁娜"),
+    (re.compile(r"枫丹廷的审判官兼大明星"), "芙宁娜"),
+]
+
+
+def normalize_identity_boast(text: str) -> str:
+    """把头衔式自报身份改写成自然自称，去掉复读模板。"""
+    if not text:
+        return text
+    t = str(text)
+    for pattern, repl in IDENTITY_BOAST_SUBS:
+        t = pattern.sub(repl, t)
+    t = re.sub(r"([，,。])\1{1,}", r"\1", t)              # 重复标点
+    # 同一句里重复自报家门 → 只保留第一次
+    t = re.sub(r"(我是芙宁娜[啊呀]?)[，,。]?\s*我?是芙宁娜[啊呀]?[，,。]?", r"\1。", t)
+    # 仅当后面紧接着又一次自报家门时才把逗号改句号
+    t = re.sub(r"(我是芙宁娜[啊呀]?)[，,。](?=[^。！？\n]{0,10}芙宁娜)", r"\1。", t)
+    return t
+
+
 def normalize_self_reference(text: str) -> str:
     """把历史/入库文本里越界的自称"本大人"归一为"我"。"""
     if not text:
@@ -266,7 +293,7 @@ class ChatEnhancerPlugin(Star):
                             continue
                         n = clean_synthetic_lines(c)
                         if m.get("role") == "assistant":
-                            n = normalize_self_reference(n)
+                            n = normalize_identity_boast(normalize_self_reference(n))
                             n2 = limit_exclamations(n, int(self.config.get("max_exclamation_per_message", 0) or 0))
                             if n2 != n:
                                 touched = True
@@ -288,7 +315,7 @@ class ChatEnhancerPlugin(Star):
                                     continue
                                 t = clean_synthetic_lines(raw)
                                 if m.get("role") == "assistant":
-                                    t = normalize_self_reference(t)
+                                    t = normalize_identity_boast(normalize_self_reference(t))
                                     t2 = limit_exclamations(t, int(self.config.get("max_exclamation_per_message", 0) or 0))
                                     if t2 != t:
                                         touched = True
@@ -832,7 +859,7 @@ class ChatEnhancerPlugin(Star):
                     continue
                 cc = m.get("content")
                 if isinstance(cc, str):
-                    n = limit_exclamations(normalize_self_reference(cc), limit)
+                    n = limit_exclamations(normalize_identity_boast(normalize_self_reference(cc)), limit)
                     if n != cc:
                         m["content"] = n
                         changed = True
@@ -843,7 +870,7 @@ class ChatEnhancerPlugin(Star):
                             and p.get("type") == "text"
                             and isinstance(p.get("text"), str)
                         ):
-                            n = limit_exclamations(normalize_self_reference(p["text"]), limit)
+                            n = limit_exclamations(normalize_identity_boast(normalize_self_reference(p["text"])), limit)
                             if n != p["text"]:
                                 p["text"] = n
                                 changed = True
@@ -871,7 +898,10 @@ class ChatEnhancerPlugin(Star):
             def _fix(t):
                 if not isinstance(t, str) or not t.strip():
                     return t
-                return limit_exclamations(clean_internal_markup(t), limit).strip() or t
+                return limit_exclamations(
+                    normalize_identity_boast(normalize_self_reference(clean_internal_markup(t))),
+                    limit,
+                ).strip() or t
 
             msgs = tool_args.get("messages")
             if isinstance(msgs, list):
@@ -906,7 +936,7 @@ class ChatEnhancerPlugin(Star):
         # 2. 收敛感叹号：直接写回 resp.completion_text，保证所有后续插件
         #    （mmx_speech voice_only 自行发文本、分段/合并转发等）拿到的都是收敛后的文本
         limited = limit_exclamations(
-            normalize_self_reference(processed_text),
+            normalize_identity_boast(normalize_self_reference(processed_text)),
             int(self.config.get("max_exclamation_per_message", 0) or 0),
         ).strip()
         if limited and limited != original_text:
