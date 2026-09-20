@@ -142,6 +142,14 @@ def normalize_identity_boast(text: str) -> str:
     return t
 
 
+# 绘图/图片生成类工具：主动开口或定时任务里一律禁止（用户没要求过就画图 = 骚扰）
+IMAGE_TOOL_RE = re.compile(
+    r"generate_image|generate_selfie|image_gen|text2img|img2img|draw_image|"
+    r"selfie|绘图|画图|生图|omnidraw",
+    re.IGNORECASE,
+)
+
+
 def normalize_self_reference(text: str) -> str:
     """把历史/入库文本里越界的自称"本大人"归一为"我"。"""
     if not text:
@@ -878,6 +886,35 @@ class ChatEnhancerPlugin(Star):
                 await conv_mgr.update_conversation(umo, cid, history=history)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[聊天增强器] 发送后标点归一失败（已忽略）: {exc}")
+
+    @filter.on_using_llm_tool(priority=99999)
+    async def block_unsolicited_image_tools(self, event, tool, tool_args):
+        """主动开口/定时任务触发时，禁止模型自作主张调用绘图类工具。
+
+        实测问题：主动回复插件触发的那一轮，模型自行调用 generate_image /
+        generate_selfie 并真的把图发到群里，而用户从未要求画图。
+        这里在工具执行前把关键参数清空，使调用无法产出图片（模型会收到参数错误）。
+        """
+        try:
+            name = str(getattr(tool, "name", "") or "")
+            if not IMAGE_TOOL_RE.search(name):
+                return
+            proactive = bool(getattr(event, "_proactive_reply", False))
+            if not proactive and hasattr(event, "get_extra"):
+                proactive = bool(event.get_extra("_proactive_reply")) or bool(
+                    event.get_extra("cron_job")
+                )
+            if not proactive:
+                return
+            if isinstance(tool_args, dict):
+                for key in ("prompt", "action", "text", "query", "description", "subject"):
+                    if key in tool_args:
+                        tool_args[key] = ""
+            logger.warning(
+                f"[聊天增强器] 拦截主动场景下的绘图工具调用: {name}（用户未要求画图）"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[聊天增强器] 绘图工具拦截失败（已忽略）: {exc}")
 
     @filter.on_using_llm_tool()
     async def sanitize_outgoing_tool_text(self, event, tool, tool_args):
